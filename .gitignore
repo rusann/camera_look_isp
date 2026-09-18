@@ -1,0 +1,60 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.Python
+venv/
+env/
+.venv/
+
+# Model weights and training artefacts
+checkpoints/
+checkpoints_*/
+style_cache/
+style_cache_*/
+*.pt
+*.pth
+*.safetensors
+*.ckpt
+
+# Datasets and anything derived from them
+data/
+raws/
+jpegs/
+prepared/
+fivek*/
+luts/
+hf_cache/
+*.dng
+*.DNG
+*.nef
+*.NEF
+*.cr2
+*.CR2
+*.arw
+*.ARW
+*.raf
+*.RAF
+*.tif
+*.tiff
+*.npz
+manifest*.jsonl
+
+# Generated outputs
+eval_out/
+eval_renderer/
+logs/
+results*.json
+output.jpg
+demo.jpg
+*.log
+
+# Keep the written reports; they are small and worth versioning
+!results.md
+!results_rl.md
+
+# Editor / OS
+.vscode/
+.idea/
+.DS_Store
+*.swp

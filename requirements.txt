@@ -1,0 +1,12 @@
+transformers>=4.57
+diffusers>=0.37
+peft>=0.13
+huggingface_hub
+bitsandbytes
+rawpy
+exifread
+pillow
+tifffile
+lpips
+numpy
+sentence-transformers
