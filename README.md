@@ -1,4 +1,5 @@
 ### LLM-управляемый ISP использующий диффузионные модели
+Веса: https://huggingface.co/rusann22022/camera-look-isp
 
 ## Установка
 
