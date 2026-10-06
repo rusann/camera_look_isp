@@ -30,7 +30,7 @@ Launch (multi-GPU server):
       --manifest data/dcp_pairs.jsonl
 """
 
-import os, io, json, math, random, argparse, time, warnings, contextlib
+import os, io, json, math, random, argparse, time, warnings, contextlib, glob
 from dataclasses import dataclass, field
 from typing import Optional
 
@@ -48,6 +48,9 @@ from PIL import Image
 @dataclass
 class Config:
     director_ckpt: str = "Qwen/Qwen3-VL-4B-Instruct"
+    director_revision: str = None   # pin a commit sha for reproducible downloads
+    renderer_revision: str = None
+    text_encoder_revision: str = None
     renderer_ckpt: str = "black-forest-labs/FLUX.2-klein-4B"
 
     use_4bit: bool = True          # QLoRA-style NF4 quant of the frozen backbones; needed to fit 24GB
@@ -87,6 +90,11 @@ class Config:
     lut_only: bool = False         # train ONLY the LUT head; theta output frozen
     lut_ce_weight: float = 0.1     # auxiliary token CE; primary signal is the render loss
     cache_avg: int = 6             # images averaged per style_key when caching
+    use_frontend: bool = False     # evaluate through the front-end from RAW,
+                                   # instead of the pre-rendered neutral image
+    split: str = "train"           # train | test | all; splitting is BY SCENE
+    split_frac: float = 0.15       # share of scenes held out for evaluation
+    demo_max_side: int = 1600      # downscale demo inputs to this long edge
     force_distill: bool = False    # distill even without a renderer that beats the guide
     rl_lr_scale: float = 0.2       # RL runs well below SFT LR; it is a nudge, not a retrain
     rl_sigma: float = 0.15         # exploration noise on theta
@@ -124,6 +132,86 @@ class Config:
     log_every: int = 20
     save_every: int = 500
     seed: int = 0
+
+
+def load_frontend(cfg, device, required=False):
+    """Load the trained front-end, or None if it has not been trained.
+
+    The style path can read a pre-rendered neutral image instead, which is how the training
+    pairs were built; passing the front-end in makes the evaluated pipeline the full one,
+    RAW included.
+    """
+    path = f"{cfg.out_dir}/frontend_final.pt"
+    if not os.path.exists(path):
+        cand = sorted(glob.glob(f"{cfg.out_dir}/frontend_*.pt"), key=os.path.getmtime)
+        path = cand[-1] if cand else None
+    if path is None or not os.path.exists(path):
+        if required:
+            raise FileNotFoundError(
+                f"front-end checkpoint not found in {cfg.out_dir}. Train it with --phase frontend.")
+        return None
+    fe = FrontEnd(cfg).to(device).eval()
+    fe.load_state_dict(torch.load(path, map_location=device))
+    fe.requires_grad_(False)
+    print(f"[frontend] active ({os.path.basename(path)})")
+    return fe
+
+
+@torch.no_grad()
+def frontend_linear(fe, it, device, cfg):
+    """Scene-referred linear image produced from the packed Bayer crop by the front-end."""
+    d = np.load(it["raw_path"])
+    bayer = torch.from_numpy(d["bayer"].astype(np.float32))[None, None].to(device)
+    ccm = torch.from_numpy(d["ccm"].astype(np.float32))[None].to(device)
+    meta = torch.tensor([[it.get("iso", 100.0), it.get("exposure", 1 / 60),
+                          it.get("fnumber", 4.0), it.get("focal_length", 35.0),
+                          1.0, 5500.0]], dtype=torch.float32, device=device)
+    x_lin, _ = fe(bayer.clamp(0, 1), meta, ccm)
+    return x_lin.clamp(0, 1)
+
+
+def scene_of(it):
+    """Scene identifier of a manifest entry. Crops are named <scene>__<style>__<k>."""
+    p = it.get("base_path") or it.get("jpeg_path", "")
+    return os.path.basename(p).split("__")[0]
+
+
+def split_manifest(items, split="all", frac=0.15, seed=0):
+    """Split BY SCENE, never by pair.
+
+    One scene produces many pairs (every style x every crop), so a pair-level split puts
+    the same pixels on both sides and the test set stops being held out. Splitting on the
+    scene identifier keeps every crop and every style of a scene on one side.
+    """
+    if split == "all":
+        return items
+    scenes = sorted({scene_of(it) for it in items})
+    rng = random.Random(seed)
+    rng.shuffle(scenes)
+    n_test = max(1, int(round(len(scenes) * frac)))
+    test = set(scenes[:n_test])
+    keep = test if split == "test" else set(scenes) - test
+    out = [it for it in items if scene_of(it) in keep]
+    if is_main():
+        print(f"[split] {split}: {len(out)} pairs from {len(keep)} scenes "
+              f"(of {len(items)} pairs / {len(scenes)} scenes)")
+    return out
+
+
+def load_manifest(path):
+    """Read a manifest, resolving any relative file paths against the manifest's own
+    directory. Manifests written with relative paths are portable between machines."""
+    base = os.path.dirname(os.path.abspath(path))
+    items = []
+    for line in open(path):
+        if not line.strip():
+            continue
+        it = json.loads(line)
+        for k in ("raw_path", "jpeg_path", "base_path", "lut_path"):
+            if k in it and not os.path.isabs(it[k]):
+                it[k] = os.path.normpath(os.path.join(base, it[k]))
+        items.append(it)
+    return items
 
 
 def quiet_third_party():
@@ -662,8 +750,10 @@ def build_style_director(cfg: Config):
     else:
         quant_kwargs["dtype"] = torch.bfloat16
 
-    base = Qwen3VLForConditionalGeneration.from_pretrained(cfg.director_ckpt, **quant_kwargs)
-    processor = AutoProcessor.from_pretrained(cfg.director_ckpt)
+    base = Qwen3VLForConditionalGeneration.from_pretrained(
+        cfg.director_ckpt, revision=cfg.director_revision, **quant_kwargs)
+    processor = AutoProcessor.from_pretrained(cfg.director_ckpt,
+                                              revision=cfg.director_revision)
     if cfg.use_4bit:
         base = prepare_model_for_kbit_training(base, use_gradient_checkpointing=cfg.grad_ckpt)
     elif cfg.grad_ckpt:
@@ -805,7 +895,7 @@ def precompute_style_cache(cfg: Config, manifest, out_dir):
         else:
             print(f"[cache_style] WARNING: {ck} missing; LUT tokens will be meaningless.\n"
                   f"  Run: python camera_look_isp.py --phase lut_vqvae --manifest <manifest>")
-    items = [json.loads(l) for l in open(manifest)]
+    items = split_manifest(load_manifest(manifest), cfg.split, cfg.split_frac)
     keys = [it.get("style_key", f"{it.get('camera', 'unk')}_{it.get('prompt', '')}") for it in items]
     os.makedirs(out_dir, exist_ok=True)
     seen = set()
@@ -1226,13 +1316,15 @@ def monotonic_penalty(base_val, plus_val, minus_val):
 # ============================== dataset ==============================
 
 class RawJPEGPairDataset(Dataset):
-    def __init__(self, manifest_path, crop=None, require_raw=True):
+    def __init__(self, manifest_path, crop=None, require_raw=True,
+                 split="all", split_frac=0.15, split_seed=0):
         if not os.path.exists(manifest_path):
             raise FileNotFoundError(
                 f"manifest not found: {manifest_path}\n"
                 f"  Generate it first, e.g.:\n"
                 f"    python make_manifest.py /mnt/data/raws /mnt/data/jpegs {manifest_path} mycam \"my look\"")
-        self.items = [json.loads(l) for l in open(manifest_path) if l.strip()]
+        self.items = split_manifest(load_manifest(manifest_path),
+                                    split, split_frac, split_seed)
         if len(self.items) == 0:
             raise ValueError(
                 f"manifest is empty: {manifest_path}\n"
@@ -1395,7 +1487,8 @@ def evaluate_frontend(cfg: Config, manifest, ckpt, n_batches=6):
     model.eval()
     isp = ParametricISP(cfg).to(device).eval()
 
-    ds = RawJPEGPairDataset(manifest, crop=cfg.frontend_crop, require_raw=True)
+    ds = RawJPEGPairDataset(manifest, crop=cfg.frontend_crop, require_raw=True,
+                            split=cfg.split, split_frac=cfg.split_frac)
     dl = DataLoader(ds, batch_size=8, shuffle=True, num_workers=4,
                     collate_fn=collate_fn, drop_last=True)
 
@@ -1458,7 +1551,8 @@ def train_frontend(cfg: Config, manifest):
     if dist.is_initialized():
         model = DDP(model, device_ids=[local_rank])
 
-    ds = RawJPEGPairDataset(manifest, crop=cfg.frontend_crop, require_raw=True)
+    ds = RawJPEGPairDataset(manifest, crop=cfg.frontend_crop, require_raw=True,
+                            split=cfg.split, split_frac=cfg.split_frac)
     sampler = DistributedSampler(ds) if dist.is_initialized() else None
     dl = DataLoader(ds, batch_size=cfg.frontend_batch, sampler=sampler, shuffle=sampler is None,
                      num_workers=8, collate_fn=collate_fn, drop_last=True, pin_memory=True)
@@ -1554,7 +1648,7 @@ def train_frontend(cfg: Config, manifest):
 
 def train_lut_vqvae(cfg: Config, manifest):
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    items = [json.loads(l) for l in open(manifest) if l.strip()]
+    items = split_manifest(load_manifest(manifest), cfg.split, cfg.split_frac)
     paths = sorted({it["lut_path"] for it in items if "lut_path" in it})
     if not paths:
         raise ValueError(
@@ -1640,7 +1734,8 @@ def train_director_sft(cfg: Config, manifest):
     if dist.is_initialized():
         director = DDP(director, device_ids=[local_rank], find_unused_parameters=True)
 
-    ds = RawJPEGPairDataset(manifest, require_raw=False)
+    ds = RawJPEGPairDataset(manifest, require_raw=False,
+                            split=cfg.split, split_frac=cfg.split_frac)
     sampler = DistributedSampler(ds) if dist.is_initialized() else None
     dl = DataLoader(ds, batch_size=cfg.director_batch, sampler=sampler, shuffle=sampler is None,
                      num_workers=8, collate_fn=collate_fn, drop_last=True)
@@ -2014,7 +2109,7 @@ def eval_prompts(cfg: Config, manifest, prompts=None, ckpt=None):
     isp = ParametricISP(cfg).to(device)
     load_director(director, cfg, ckpt, required=True)
 
-    items = [json.loads(l) for l in open(manifest) if l.strip()]
+    items = split_manifest(load_manifest(manifest), cfg.split, cfg.split_frac)
     it = items[0]
     src_path = it.get("base_path", it["jpeg_path"])
     img = Image.open(src_path).convert("RGB")
@@ -2227,7 +2322,7 @@ def train_director_rl(cfg: Config, manifest):
             print("[director-rl] WARNING: --use_lut but no tokenizer found; rendering theta-only. "
                   "The anchor term will push theta to compensate for the absent LUT.")
 
-    items = [json.loads(l) for l in open(manifest) if l.strip()]
+    items = split_manifest(load_manifest(manifest), cfg.split, cfg.split_frac)
     items = [it for it in items if "base_path" in it]
     if not items:
         raise ValueError("RL needs 'base_path' in the manifest; rebuild with build_dataset.py")
@@ -2312,6 +2407,14 @@ def train_director_rl(cfg: Config, manifest):
             save_director(director, cfg, f"rl_{step}")
     save_director(director, cfg, "final")
 
+RENDERER_HEADS = (
+    "input_adapter",
+    "output_adapter",
+    "style_to_ctx",
+    "paramnet",
+    "meta_gate",
+    "bgrid_head",
+)
 
 def save_renderer(renderer, cfg, tag):
     """Saves the DiT LoRA together with the trainable adapters, which
@@ -2351,7 +2454,7 @@ def psnr(a, b):
     return float(10 * torch.log10(1.0 / mse.clamp(min=1e-10)))
 
 
-def probe_guide(cfg: Config, manifest, n=6, ckpt=None):
+def probe_guide(cfg: Config, manifest, n=24, ckpt=None):
     """Why is the guide worse than the untouched base? Four renders, same target.
 
       neutral   isp(base, theta=0)      -> should equal dE(base,target). If not, the ISP
@@ -2387,7 +2490,10 @@ def probe_guide(cfg: Config, manifest, n=6, ckpt=None):
     else:
         print("[probe] LUT path OFF (pass --use_lut to include it; theta-only otherwise)")
 
-    items = [json.loads(l) for l in open(manifest) if l.strip()]
+    fe = load_frontend(cfg, device) if cfg.use_frontend else None
+    items = split_manifest(load_manifest(manifest), cfg.split, cfg.split_frac)
+    if fe is not None:
+        items = [it for it in items if "raw_path" in it and os.path.exists(it["raw_path"])]
     random.Random(0).shuffle(items)
     items = items[:n]
 
@@ -2401,7 +2507,8 @@ def probe_guide(cfg: Config, manifest, n=6, ckpt=None):
         to_t = lambda im: torch.from_numpy(np.array(im, dtype=np.float32) / 255.0
                                            ).permute(2, 0, 1)[None].to(device)
         base_t, tgt_t = to_t(base), to_t(tgt)
-        x_lin = decode_transfer(base_t, cfg.transfer)
+        x_lin = (frontend_linear(fe, it, device, cfg) if fe is not None
+                 else decode_transfer(base_t, cfg.transfer))
         key = it.get("style_key", "")
 
         d_base = float(delta_e00(base_t, tgt_t))
@@ -2454,7 +2561,7 @@ def probe_guide(cfg: Config, manifest, n=6, ckpt=None):
               f"({m['live']:.2f}); rebuild the style cache")
 
 
-def eval_renderer(cfg: Config, manifest, n_images=8, ckpt=None):
+def eval_renderer(cfg: Config, manifest, n_images=40, ckpt=None):
     """Does the renderer actually beat the deterministic guide?
 
     The guide (parametric ISP alone) is a complete result on its own, so the only question
@@ -2470,7 +2577,17 @@ def eval_renderer(cfg: Config, manifest, n_images=8, ckpt=None):
         lp = LPIPSLoss().to(device)
     cache = StyleCache(cfg.style_cache_dir) if cfg.use_style_cache else None
 
-    items = [json.loads(l) for l in open(manifest) if l.strip()][:n_images]
+    fe = load_frontend(cfg, device) if cfg.use_frontend else None
+    items = split_manifest(load_manifest(manifest), cfg.split, cfg.split_frac)
+    if fe is not None:
+        items = [it for it in items if "raw_path" in it and os.path.exists(it["raw_path"])]
+    # по одной паре на сцену: подряд идущие записи относятся к одному кадру,
+    # и оценка на них описывает один сюжет, а не выборку
+    by_scene = {}
+    for it in items:
+        by_scene.setdefault(scene_of(it), []).append(it)
+    rng_s = random.Random(0)
+    items = [rng_s.choice(v) for _, v in sorted(by_scene.items())][:n_images]
     os.makedirs("eval_renderer", exist_ok=True)
     agg = {"g_psnr": 0.0, "p_psnr": 0.0, "g_lpips": 0.0, "p_lpips": 0.0,
            "g_de": 0.0, "p_de": 0.0, "drift": 0.0, "res": 0.0, "base_de": 0.0}
@@ -2484,7 +2601,8 @@ def eval_renderer(cfg: Config, manifest, n_images=8, ckpt=None):
         tgt = Image.open(it["jpeg_path"]).convert("RGB")
         t = lambda im: torch.from_numpy(np.array(im, dtype=np.float32) / 255.0).permute(2, 0, 1)[None].to(device)
         base_t, tgt_t = t(base), t(tgt)
-        x_lin = decode_transfer(base_t, cfg.transfer)
+        x_lin = (frontend_linear(fe, it, device, cfg) if fe is not None
+                 else decode_transfer(base_t, cfg.transfer))
         meta = torch.tensor([[it.get("iso", 100.0), it.get("exposure", 1 / 60),
                               it.get("fnumber", 4.0), it.get("focal_length", 35.0),
                               1.0, 5500.0]], dtype=torch.float32, device=device)
@@ -2587,7 +2705,8 @@ def train_renderer(cfg: Config, manifest, stage: int):
     if dist.is_initialized():
         renderer = DDP(renderer, device_ids=[local_rank], find_unused_parameters=True)
 
-    ds = RawJPEGPairDataset(manifest, crop=cfg.renderer_res, require_raw=False)
+    ds = RawJPEGPairDataset(manifest, crop=cfg.renderer_res, require_raw=False,
+                            split=cfg.split, split_frac=cfg.split_frac)
     sampler = DistributedSampler(ds) if dist.is_initialized() else None
     dl = DataLoader(ds, batch_size=cfg.renderer_batch, sampler=sampler, shuffle=sampler is None,
                      num_workers=8, collate_fn=collate_fn, drop_last=True)
@@ -2704,6 +2823,12 @@ def main():
     ap.add_argument("--stage", type=int, default=1)
     ap.add_argument("--epochs", type=int, default=None)
     ap.add_argument("--max_steps", type=int, default=None, help="0 disables the cap (full-corpus/server run)")
+    ap.add_argument("--use_frontend", action="store_true",
+                     help="evaluate the full pipeline from RAW through the trained "
+                          "front-end, instead of the pre-rendered neutral image")
+    ap.add_argument("--split", choices=["train", "test", "all"], default=None,
+                     help="which scene split to use; training defaults to train, "
+                          "evaluation phases to test")
     ap.add_argument("--lut_only", action="store_true",
                      help="train only the LUT head; freezes LoRA/pool_norm/theta_head so "
                           "a working theta director cannot regress")
@@ -2769,6 +2894,13 @@ def main():
         cfg.theta_l2, cfg.head_lr_mult = 2e-2, 1.5
         cfg.lr_director = min(cfg.lr_director, 5e-5)
         cfg.max_steps = cfg.max_steps or 3000
+    if args.use_frontend:
+        cfg.use_frontend = True
+    if args.split:
+        cfg.split = args.split
+    elif args.phase in ("probe_guide", "eval_prompts", "eval_renderer",
+                        "eval_frontend"):
+        cfg.split = "test"      # оценка по умолчанию на отложенных сценах
     if args.lut_only:
         cfg.lut_only = True
     if args.out_dir:

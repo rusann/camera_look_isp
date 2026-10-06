@@ -72,7 +72,10 @@ def run_benchmark(cfg, manifest, n=200, seed=0):
             lut_vq = C.LUTVQVAE(cfg).to(device).eval()
             lut_vq.load_state_dict(torch.load(ckv, map_location=device))
 
-    items = [json.loads(l) for l in open(manifest) if l.strip()]
+    fe = C.load_frontend(cfg, device) if getattr(cfg, "use_frontend", False) else None
+    items = C.split_manifest(C.load_manifest(manifest), cfg.split, cfg.split_frac)
+    if fe is not None:
+        items = [it for it in items if "raw_path" in it and os.path.exists(it["raw_path"])]
     random.Random(seed).shuffle(items)
     items = items[:n]
 
@@ -83,7 +86,8 @@ def run_benchmark(cfg, manifest, n=200, seed=0):
         tgt = Image.open(it["jpeg_path"]).convert("RGB")
         to_t = lambda im: torch.from_numpy(np.array(im, np.float32) / 255.).permute(2, 0, 1)[None].to(device)
         b_t, t_t = to_t(base), to_t(tgt)
-        x_lin = C.decode_transfer(b_t, cfg.transfer)
+        x_lin = (C.frontend_linear(fe, it, device, cfg) if fe is not None
+                 else C.decode_transfer(b_t, cfg.transfer))
 
         t0 = time.perf_counter()
         with torch.autocast("cuda", dtype=torch.bfloat16):
@@ -112,6 +116,8 @@ def run_benchmark(cfg, manifest, n=200, seed=0):
     agg = {
         "n": len(rows),
         "dE_mean": float(np.mean([r["dE"] for r in rows])),
+        "dE_std": float(np.std([r["dE"] for r in rows], ddof=1)),
+        "dE_ci95": float(1.96 * np.std([r["dE"] for r in rows], ddof=1) / max(len(rows), 1) ** 0.5),
         "dE_median": pct([r["dE"] for r in rows], 50),
         "dE_p95": pct([r["dE"] for r in rows], 95),
         "dE_null_mean": float(np.mean([r["dE_null"] for r in rows])),
@@ -132,7 +138,7 @@ def controllability(cfg, manifest, device):
     director = C.StyleDirector(cfg).to(device).eval()
     C.load_director(director, cfg, required=True)
     isp = C.ParametricISP(cfg).to(device)
-    items = [json.loads(l) for l in open(manifest) if l.strip()]
+    items = C.load_manifest(manifest)
     it = items[0]
     img = Image.open(it.get("base_path", it["jpeg_path"])).convert("RGB")
     t = torch.from_numpy(np.array(img, np.float32) / 255.).permute(2, 0, 1)[None].to(device)
@@ -167,7 +173,7 @@ def hallucination_audit(cfg, manifest, device, n=40):
     C.load_renderer(renderer, cfg, required=True)
     isp = C.ParametricISP(cfg).to(device)
     cache = C.StyleCache(cfg.style_cache_dir)
-    items = [json.loads(l) for l in open(manifest) if l.strip()][:n]
+    items = C.load_manifest(manifest)[:n]
     res, drift = [], []
     for it in items:
         base = Image.open(it.get("base_path", it["jpeg_path"])).convert("RGB")
@@ -207,12 +213,14 @@ def write_report(cfg, agg, rows, per_style, per_cam, ctrl, halluc, params, path=
 
     L = []
     L.append("# Camera-look ISP: evaluation\n")
+    L.append(f"Input path: {'RAW -> front-end' if getattr(cfg,'use_frontend',False) else 'pre-rendered neutral image'}.\n")
     L.append(f"Evaluated on {agg['n']} held-out pairs. "
              f"LUT head: {'on' if cfg.use_lut else 'off'}.\n")
     L.append("## Colour fidelity\n")
     L.append("| metric | value |")
     L.append("|---|---|")
-    L.append(f"| dE00 mean | {agg['dE_mean']:.2f} |")
+    L.append(f"| dE00 mean | {agg['dE_mean']:.2f} ± {agg['dE_ci95']:.2f} (95% CI) |")
+    L.append(f"| dE00 std | {agg['dE_std']:.2f} |")
     L.append(f"| dE00 median | {agg['dE_median']:.2f} |")
     L.append(f"| dE00 p95 | {agg['dE_p95']:.2f} |")
     L.append(f"| dE00 of untouched base (null) | {agg['dE_null_mean']:.2f} |")
@@ -228,8 +236,16 @@ def write_report(cfg, agg, rows, per_style, per_cam, ctrl, halluc, params, path=
     L.append("## Per-style dE00 (mean)\n")
     L.append("| style | dE00 | n |")
     L.append("|---|---|---|")
+    MIN_N = 5
+    small = [k for k, v in per_style.items() if len(v) < MIN_N]
     for k, v in sorted(per_style.items(), key=lambda kv: np.mean(kv[1])):
+        if len(v) < MIN_N:
+            continue
         L.append(f"| {k} | {np.mean(v):.2f} | {len(v)} |")
+    if small:
+        L.append("")
+        L.append(f"{len(small)} styles with fewer than {MIN_N} samples are omitted: "
+                 f"a mean over one or two images is not an estimate.")
     L.append("")
     L.append("## Per-camera dE00 (cross-device generalisation)\n")
     L.append("| camera | dE00 | n |")
@@ -488,7 +504,7 @@ def tier_report(cfg, manifest, n=60):
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     isp = C.ParametricISP(cfg).to(device)
     cache = C.StyleCache(cfg.style_cache_dir)
-    items = [json.loads(l) for l in open(manifest) if l.strip()][:n]
+    items = C.load_manifest(manifest)[:n]
     pack_path = os.path.join(cfg.out_dir, "style_pack.pt")
     packs = torch.load(pack_path, map_location=device)["luts"] if os.path.exists(pack_path) else {}
 
@@ -545,6 +561,9 @@ class TextLookStudent(nn.Module):
         return self.theta(h), self.lut(h).view(-1, self.cfg.lut_tokens, self.cfg.lut_codebook)
 
 
+_TEXT_ENC_CFG = None
+
+
 def _load_text_encoder(device):
     """Frozen sentence encoder. MiniLM is 22M params / ~90 MB, which is mobile-viable;
     falls back to a hashed bag-of-words if it is not installed, which still works for
@@ -552,8 +571,9 @@ def _load_text_encoder(device):
     try:
         from transformers import AutoTokenizer, AutoModel
         name = "sentence-transformers/all-MiniLM-L6-v2"
-        tok = AutoTokenizer.from_pretrained(name)
-        enc = AutoModel.from_pretrained(name).to(device).eval()
+        rev = getattr(_TEXT_ENC_CFG, "text_encoder_revision", None)
+        tok = AutoTokenizer.from_pretrained(name, revision=rev)
+        enc = AutoModel.from_pretrained(name, revision=rev).to(device).eval()
         enc.requires_grad_(False)
         dim = enc.config.hidden_size
 
@@ -600,7 +620,7 @@ def distill_director(cfg, manifest, steps=3000, n_images=4):
             lut_vq.load_state_dict(torch.load(ckv, map_location=device))
             lut_vq.requires_grad_(False)
 
-    items = [json.loads(l) for l in open(manifest) if l.strip() and "base_path" in json.loads(l)]
+    items = [it for it in C.load_manifest(manifest) if "base_path" in it]
     prompts = sorted({it.get("prompt", "") for it in items if it.get("prompt")})
     rng = random.Random(0)
     imgs = [Image.open(it["base_path"]).convert("RGB") for it in rng.sample(items, min(n_images, len(items)))]
@@ -689,6 +709,24 @@ def distill_director(cfg, manifest, steps=3000, n_images=4):
               open(os.path.join(cfg.out_dir, "distill_director.json"), "w"), indent=2)
 
 
+RAW_EXT = (".dng", ".nef", ".cr2", ".cr3", ".arw", ".raf", ".rw2", ".orf", ".pef")
+
+
+def load_input_image(path):
+    """Accept either a RAW file or an ordinary image.
+
+    RAW files are rendered with the same settings used to build the training targets, so a
+    demo on a RAW file goes through the identical neutral rendering the model was trained on.
+    """
+    if path.lower().endswith(RAW_EXT):
+        import rawpy
+        with rawpy.imread(path) as raw:
+            rgb = raw.postprocess(no_auto_bright=True, output_bps=8,
+                                  use_camera_wb=True, gamma=(2.222, 4.5))
+        return Image.fromarray(rgb)
+    return Image.open(path).convert("RGB")
+
+
 @torch.no_grad()
 def apply_look(cfg, image_path, prompt, out_path="output.jpg", use_student=True):
     """End-to-end inference using ONLY the deployable components.
@@ -705,7 +743,10 @@ def apply_look(cfg, image_path, prompt, out_path="output.jpg", use_student=True)
         lut_vq = C.LUTVQVAE(cfg).to(device).eval()
         lut_vq.load_state_dict(torch.load(ckv, map_location=device))
 
-    img = Image.open(image_path).convert("RGB")
+    img = load_input_image(image_path)
+    side = getattr(cfg, "demo_max_side", 1600)
+    if max(img.size) > side:
+        img.thumbnail((side, side), Image.LANCZOS)
     t = torch.from_numpy(np.array(img, np.float32) / 255.).permute(2, 0, 1)[None].to(device)
     x_lin = C.decode_transfer(t, cfg.transfer)
 
@@ -756,15 +797,25 @@ def heldout_camera_eval(cfg, manifest, n_hold=2, n=200, seed=0):
     claim that a look transfers across sensors needs bodies that were held out, so this
     splits by camera and reports seen vs unseen separately.
     """
-    items = [json.loads(l) for l in open(manifest) if l.strip()]
+    items = C.load_manifest(manifest)
     cams = sorted({it.get("camera", "?") for it in items})
     if len(cams) <= n_hold:
         print(f"only {len(cams)} camera bodies; cannot hold out {n_hold}")
         return
-    rng = random.Random(seed)
-    held = set(rng.sample(cams, n_hold))
+    # Выбираем камеры с НАИБОЛЬШИМ числом различных сцен, а не случайные: случайный
+    # выбор может оставить в отложенной части два-три кадра, и вывод о переносе будет
+    # сделан по ним.
+    by_cam = {}
+    for it in items:
+        by_cam.setdefault(it.get("camera", "?"), set()).add(C.scene_of(it))
+    ranked = sorted(cams, key=lambda c: -len(by_cam.get(c, ())))
+    held = set(ranked[:n_hold])
+    n_scenes_held = sum(len(by_cam[c]) for c in held)
     print(f"held-out bodies: {sorted(held)}")
+    print(f"  distinct scenes held out: {n_scenes_held}")
     print(f"seen bodies    : {len(cams)-n_hold}")
+    if n_scenes_held < 10:
+        print(f"  warning: only {n_scenes_held} scenes held out; the estimate is weak")
 
     import tempfile
     res = {}
@@ -794,12 +845,236 @@ def heldout_camera_eval(cfg, manifest, n_hold=2, n=200, seed=0):
               open(os.path.join(cfg.out_dir, "heldout_camera.json"), "w"), indent=2)
 
 
+@torch.no_grad()
+def make_figure(cfg, image_path, prompts, out_path="figure.png", cols=0):
+    """Render one image under several prompts into a single labelled grid."""
+    from PIL import ImageDraw
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    isp = C.ParametricISP(cfg).to(device)
+    lut_vq = None
+    ckv = os.path.join(cfg.out_dir, "lut_vqvae.pt")
+    if cfg.use_lut and os.path.exists(ckv):
+        lut_vq = C.LUTVQVAE(cfg).to(device).eval()
+        lut_vq.load_state_dict(torch.load(ckv, map_location=device))
+
+    img = load_input_image(image_path)
+    side = getattr(cfg, "demo_max_side", 1600)
+    if max(img.size) > side:
+        img.thumbnail((side, side), Image.LANCZOS)
+    t = torch.from_numpy(np.array(img, np.float32) / 255.).permute(2, 0, 1)[None].to(device)
+    x_lin = C.decode_transfer(t, cfg.transfer)
+
+    sp = os.path.join(cfg.out_dir, "text_look_student.pt")
+    use_student = os.path.exists(sp)
+    if use_student:
+        blob = torch.load(sp, map_location=device)
+        embed, dim, _ = _load_text_encoder(device)
+        student = TextLookStudent(cfg, blob["dim"]).to(device).eval()
+        student.load_state_dict(blob["student"])
+    else:
+        C.sync_for(cfg)
+        director = C.StyleDirector(cfg).to(device).eval()
+        C.load_director(director, cfg, required=True)
+
+    panels = [("input", img)]
+    for p in prompts:
+        if use_student:
+            theta, lut_logits = student(embed([p]))
+        else:
+            with torch.autocast("cuda", dtype=torch.bfloat16):
+                theta, lut_logits, _ = director([img], [p])
+            theta, lut_logits = theta.float(), lut_logits.float()
+        lut = lut_vq.decode_from_ids(lut_logits.argmax(-1)) if lut_vq is not None else None
+        out = isp(x_lin, theta, lut).clamp(0, 1)
+        arr = (out[0].permute(1, 2, 0).cpu().numpy() * 255).astype(np.uint8)
+        panels.append((p, Image.fromarray(arr)))
+
+    w, h = panels[0][1].size
+    cols = cols or min(len(panels), 3)
+    rows = (len(panels) + cols - 1) // cols
+    bar = 28
+    sheet = Image.new("RGB", (cols * w, rows * (h + bar)), "white")
+    draw = ImageDraw.Draw(sheet)
+    for i, (label, im) in enumerate(panels):
+        x, y = (i % cols) * w, (i // cols) * (h + bar)
+        sheet.paste(im, (x, y))
+        draw.text((x + 6, y + h + 8), label[:70], fill="black")
+    sheet.save(out_path)
+    print(f"{len(panels)} panels -> {out_path}")
+
+
+def contact_sheet(raw_dir, out_path="contact_sheet.jpg", n=24, side=256):
+    """Preview available RAW files so example images can be chosen without opening each one."""
+    import glob
+    from PIL import ImageDraw
+    files = []
+    for e in RAW_EXT:
+        files += glob.glob(os.path.join(raw_dir, "**", "*" + e), recursive=True)
+        files += glob.glob(os.path.join(raw_dir, "**", "*" + e.upper()), recursive=True)
+    files = sorted(set(files))[:n]
+    if not files:
+        print(f"no RAW files under {raw_dir}")
+        return
+    cols = 6
+    rows = (len(files) + cols - 1) // cols
+    bar = 18
+    sheet = Image.new("RGB", (cols * side, rows * (side + bar)), "white")
+    draw = ImageDraw.Draw(sheet)
+    for i, f in enumerate(files):
+        try:
+            im = load_input_image(f)
+            im.thumbnail((side, side), Image.LANCZOS)
+        except Exception:
+            continue
+        x, y = (i % cols) * side, (i // cols) * (side + bar)
+        sheet.paste(im, (x, y))
+        draw.text((x + 4, y + side + 4), os.path.basename(f)[:34], fill="black")
+        print(f"  {i:3d}  {f}")
+    sheet.save(out_path, quality=92)
+    print(f"\n{len(files)} previews -> {out_path}")
+
+
+RELEASE_FILES = [
+    ("director_final.pt", True,  "director LoRA + heads"),
+    ("lut_vqvae.pt",      True,  "LUT tokeniser"),
+    ("style_pack.pt",     False, "baked 3D LUTs, one per style"),
+    ("text_look_student.pt", False, "distilled text-only director"),
+    ("frontend_final.pt", False, "front-end denoise/demosaic"),
+]
+
+
+def export_release(cfg, manifest=None, out_dir="release"):
+    """Assemble everything a third party needs to reproduce results without retraining.
+
+    Weights alone are not enough: results depend on the config the checkpoint was trained
+    with, on the exact revisions of the base models pulled from the hub, and on the library
+    versions. All three are recorded here, with checksums so a corrupted download is
+    detectable.
+    """
+    import hashlib, shutil, subprocess
+    os.makedirs(out_dir, exist_ok=True)
+
+    def sha(path, buf=1 << 20):
+        h = hashlib.sha256()
+        with open(path, "rb") as f:
+            while True:
+                b = f.read(buf)
+                if not b:
+                    break
+                h.update(b)
+        return h.hexdigest()
+
+    files = {}
+    for name, required, desc in RELEASE_FILES:
+        src = os.path.join(cfg.out_dir, name)
+        if not os.path.exists(src):
+            if required:
+                print(f"missing required file: {src}")
+            else:
+                print(f"skipping absent optional file: {name}")
+            continue
+        shutil.copy2(src, os.path.join(out_dir, name))
+        files[name] = {"sha256": sha(src), "bytes": os.path.getsize(src), "description": desc}
+
+    cache_src = cfg.style_cache_dir
+    if os.path.isdir(cache_src):
+        dst = os.path.join(out_dir, "style_cache")
+        if os.path.isdir(dst):
+            shutil.rmtree(dst)
+        shutil.copytree(cache_src, dst)
+        n = len([f for f in os.listdir(dst) if f.endswith(".pt")])
+        files["style_cache/"] = {"entries": n,
+                                 "description": "cached theta/LUT per style_key"}
+
+    if manifest:
+        # Checkpoints alone do not reproduce the numbers: the benchmark evaluates a fixed
+        # subset of the manifest, so the identical pairs have to travel with them. Paths are
+        # rewritten relative to the bundle so it works on any machine.
+        eval_dir = os.path.join(out_dir, "eval_data")
+        os.makedirs(eval_dir, exist_ok=True)
+        items = C.load_manifest(manifest)
+        rng = random.Random(0)
+        rng.shuffle(items)
+        subset, copied, nbytes = items[:200], set(), 0
+        out_items = []
+        for it in subset:
+            rec = dict(it)
+            for key in ("jpeg_path", "base_path", "lut_path"):
+                src = it.get(key)
+                if not src or not os.path.exists(src):
+                    rec.pop(key, None)
+                    continue
+                name = os.path.basename(src)
+                if name not in copied:
+                    shutil.copy2(src, os.path.join(eval_dir, name))
+                    copied.add(name)
+                    nbytes += os.path.getsize(os.path.join(eval_dir, name))
+                rec[key] = os.path.join("eval_data", name)
+            rec.pop("raw_path", None)
+            out_items.append(rec)
+        with open(os.path.join(out_dir, "manifest.jsonl"), "w") as f:
+            for rec in out_items:
+                f.write(json.dumps(rec) + "\n")
+        files["eval_data/"] = {"entries": len(copied), "bytes": nbytes,
+                               "description": f"{len(out_items)} evaluation pairs, "
+                                              f"relative paths"}
+
+    def pkg(name):
+        try:
+            import importlib.metadata as md
+            return md.version(name)
+        except Exception:
+            return None
+
+    meta = {
+        "config": {k: v for k, v in vars(cfg).items()
+                   if isinstance(v, (int, float, str, bool, type(None)))},
+        "base_models": {
+            "director": {"repo": cfg.director_ckpt, "revision": cfg.director_revision},
+            "renderer": {"repo": cfg.renderer_ckpt, "revision": cfg.renderer_revision},
+            "text_encoder": {"repo": "sentence-transformers/all-MiniLM-L6-v2",
+                             "revision": cfg.text_encoder_revision},
+        },
+        "versions": {p: pkg(p) for p in
+                     ["torch", "transformers", "diffusers", "peft", "numpy",
+                      "sentence-transformers", "lpips", "rawpy"]},
+        "files": files,
+        "manifest": os.path.basename(manifest) if manifest else None,
+        "notes": "Set the recorded revisions when loading base models, or results will "
+                 "drift if those repositories are updated.",
+    }
+    try:
+        meta["git_commit"] = subprocess.check_output(
+            ["git", "rev-parse", "HEAD"], stderr=subprocess.DEVNULL).decode().strip()
+    except Exception:
+        meta["git_commit"] = None
+
+    with open(os.path.join(out_dir, "release.json"), "w") as f:
+        json.dump(meta, f, indent=2)
+
+    total = sum(v.get("bytes", 0) for v in files.values()) / 1024 / 1024
+    print(f"\nrelease -> {out_dir}/  ({len(files)} entries, {total:.0f} MB)")
+    if manifest:
+        print("\nreproduce the reported metrics with:")
+        print(f"  python bench_distill.py --phase benchmark \\")
+        print(f"      --manifest {out_dir}/manifest.jsonl --out_dir {out_dir} \\")
+        print(f"      --style_cache_dir {out_dir}/style_cache --use_lut")
+    for k, v in files.items():
+        if "bytes" in v:
+            print(f"  {k:26} {v['bytes']/1024/1024:8.1f} MB  {v['description']}")
+        else:
+            print(f"  {k:26} {v['entries']:8d} entries  {v['description']}")
+    missing = [k for k, _ in meta["versions"].items() if meta["versions"][k] is None]
+    if missing:
+        print(f"  (version not resolved for: {', '.join(missing)})")
+
+
 def main():
     C.quiet_third_party()
     ap = argparse.ArgumentParser()
     ap.add_argument("--phase", required=True,
                     choices=["benchmark", "distill", "distill_director", "bake", "tiers",
-                             "apply", "heldout"])
+                             "apply", "heldout", "figure", "thumbs", "release"])
     ap.add_argument("--manifest", default=None)
     ap.add_argument("--image", default=None, help="apply: input image")
     ap.add_argument("--prompt", default=None, help="apply: the look to apply")
@@ -807,12 +1082,17 @@ def main():
     ap.add_argument("--no_student", action="store_true",
                     help="apply: use the full VLM instead of the distilled student")
     ap.add_argument("--hold", type=int, default=2, help="heldout: bodies to hold out")
+    ap.add_argument("--prompts", nargs="*", default=None, help="figure: prompts to render")
+    ap.add_argument("--raw_dir", default="/mnt/data/fivek_dng", help="thumbs: directory to preview")
     ap.add_argument("--out_dir", default=None)
     ap.add_argument("--style_cache_dir", default=None)
     ap.add_argument("--use_lut", action="store_true")
     ap.add_argument("--max_steps", type=int, default=4000)
     ap.add_argument("--n", type=int, default=200)
     ap.add_argument("--report", default="results")
+    ap.add_argument("--split", choices=["train", "test", "all"], default="test")
+    ap.add_argument("--use_frontend", action="store_true",
+                    help="evaluate from RAW through the trained front-end")
     ap.add_argument("--force", action="store_true",
                     help="distill even if the renderer does not beat the guide")
     args = ap.parse_args()
@@ -826,6 +1106,9 @@ def main():
     if args.use_lut:
         cfg.use_lut = True
     cfg.force_distill = args.force
+    cfg.split = args.split
+    cfg.use_frontend = args.use_frontend
+    globals()['_TEXT_ENC_CFG'] = cfg
     # Match whatever preset trained the checkpoint. Rebuilding with a different LoRA rank
     # produces a wall of shape-mismatch errors at load time; the checkpoint knows its rank.
     dpath = os.path.join(cfg.out_dir, "director_final.pt")
@@ -850,6 +1133,17 @@ def main():
             print("apply needs --image and --prompt")
             return
         apply_look(cfg, args.image, args.prompt, args.out, use_student=not args.no_student)
+    elif args.phase == "figure":
+        prompts = args.prompts or [
+            "make this look like it was shot on a Fujifilm camera",
+            "make this warmer",
+            "high contrast black and white",
+        ]
+        make_figure(cfg, args.image, prompts, args.out if args.out != "output.jpg" else "figure.png")
+    elif args.phase == "thumbs":
+        contact_sheet(args.raw_dir, n=args.n)
+    elif args.phase == "release":
+        export_release(cfg, args.manifest)
     elif args.phase == "heldout":
         heldout_camera_eval(cfg, args.manifest, n_hold=args.hold, n=args.n)
     elif args.phase == "bake":
